@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -170,7 +172,8 @@ func TestMgmtNetworksForCleanupIncludesStateRecordedNetworks(t *testing.T) {
 // "destroytest" name. The behavior is read by every instance NewContainerLab creates for
 // the duration of one test.
 type destroyTestBehavior struct {
-	// containers is returned by the first ListContainers call.
+	// containers is returned by ListContainers calls that carry no label filter
+	// reduction (the first inventory call and name-filtered per-node calls).
 	containers []clabruntime.GenericContainer
 	// failCreateNet makes CreateNet return an error, which fails makeCopyForDestroy.
 	failCreateNet bool
@@ -180,6 +183,25 @@ type destroyTestBehavior struct {
 	// listEmptyAfterFirst makes every ListContainers call after the first return no
 	// containers, so the inner destroy completes without touching nodes.
 	listEmptyAfterFirst bool
+	// deletedNames records every DeleteContainer call's name, guarded by mu,
+	// so tests can assert which containers the destroy actually removed.
+	mu           sync.Mutex
+	deletedNames []string
+}
+
+// recordDelete stores a container name passed to DeleteContainer.
+func (b *destroyTestBehavior) recordDelete(name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deletedNames = append(b.deletedNames, name)
+}
+
+// DeletedNames returns a copy of the recorded DeleteContainer names.
+func (b *destroyTestBehavior) DeletedNames() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return append([]string(nil), b.deletedNames...)
 }
 
 var destroyTestRuntimeBehavior atomic.Pointer[destroyTestBehavior]
@@ -248,7 +270,7 @@ func (*fakeDestroyRuntime) GetRuntimeSocket() (string, error) { return "", nil }
 
 func (f *fakeDestroyRuntime) ListContainers(
 	_ context.Context,
-	_ []*clabtypes.GenericFilter,
+	gfilters []*clabtypes.GenericFilter,
 ) ([]clabruntime.GenericContainer, error) {
 	behavior := destroyTestRuntimeBehavior.Load()
 	if behavior == nil {
@@ -261,6 +283,47 @@ func (f *fakeDestroyRuntime) ListContainers(
 			return nil, errors.New("synthetic runtime failure")
 		case behavior.listEmptyAfterFirst:
 			return nil, nil
+		}
+	}
+
+	return selectDestroyTestContainers(behavior, gfilters)
+}
+
+// selectDestroyTestContainers returns containers matching the filters the
+// fake runtime receives: name filters match by name, internal-node and
+// tool-type label filters yield nothing, and lab-label listing yields all
+// declared lab containers.
+func selectDestroyTestContainers(
+	behavior *destroyTestBehavior,
+	gfilters []*clabtypes.GenericFilter,
+) ([]clabruntime.GenericContainer, error) {
+	for _, gF := range gfilters {
+		if gF.FilterType == "label" &&
+			(gF.Field == clabconstants.InternalNode || gF.Field == clabconstants.ToolType) {
+			return nil, nil
+		}
+	}
+
+	for _, gF := range gfilters {
+		if gF.FilterType != "name" {
+			continue
+		}
+		re, err := regexp.Compile("^" + gF.Match + "$")
+		if err != nil {
+			return nil, err
+		}
+		var out []clabruntime.GenericContainer
+		for _, ctr := range behavior.containers {
+			if len(ctr.Names) > 0 && re.MatchString(ctr.Names[0]) {
+				out = append(out, ctr)
+			}
+		}
+		return out, nil
+	}
+
+	for _, gF := range gfilters {
+		if gF.FilterType == "label" && gF.Field == clabconstants.Containerlab {
+			return behavior.containers, nil
 		}
 	}
 
@@ -281,12 +344,27 @@ func (*fakeDestroyRuntime) CreateNet(
 
 func (*fakeDestroyRuntime) DeleteNet(context.Context) error { return nil }
 
-func (*fakeDestroyRuntime) DeleteContainer(context.Context, string) error { return nil }
+func (f *fakeDestroyRuntime) DeleteContainer(_ context.Context, cID string) error {
+	if behavior := destroyTestRuntimeBehavior.Load(); behavior != nil {
+		behavior.recordDelete(cID)
+	}
+	return nil
+}
 
-func (*fakeDestroyRuntime) GetContainerStatus(
-	context.Context,
-	string,
+func (f *fakeDestroyRuntime) GetContainerStatus(
+	_ context.Context,
+	cID string,
 ) clabruntime.ContainerStatus {
+	behavior := destroyTestRuntimeBehavior.Load()
+	if behavior == nil {
+		return clabruntime.NotFound
+	}
+	for _, ctr := range behavior.containers {
+		if len(ctr.Names) > 0 && ctr.Names[0] == cID &&
+			(ctr.State == "running" || ctr.State == "exited") {
+			return clabruntime.Running
+		}
+	}
 	return clabruntime.NotFound
 }
 
@@ -988,4 +1066,123 @@ func boolToInt(b bool) int {
 	}
 
 	return 0
+}
+
+// TestDedupeContainersByID exercises destroy's container list union dedup.
+func TestDedupeContainersByID(t *testing.T) {
+	t.Parallel()
+
+	mk := func(id, name string) clabruntime.GenericContainer {
+		return clabruntime.GenericContainer{ID: id, Names: []string{name}}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		input []clabruntime.GenericContainer
+		want  []string
+	}{
+		{
+			"empty",
+			nil,
+			[]string{},
+		},
+		{
+			"first occurrence wins",
+			[]clabruntime.GenericContainer{mk("a", "n1"), mk("b", "n2"), mk("a", "n1-dup")},
+			[]string{"n1", "n2"},
+		},
+		{
+			"no id is kept in place",
+			[]clabruntime.GenericContainer{
+				mk("a", "n1"),
+				{Names: []string{"noid"}},
+				mk("a", "n1-dup"),
+			},
+			[]string{"n1", "noid"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dedupeContainersByID(tc.input)
+			want := make([]string, 0, len(tc.want))
+			for _, ctr := range got {
+				want = append(want, ctr.Names[0])
+			}
+			if diff := cmp.Diff(tc.want, want); diff != "" {
+				t.Fatalf("dedupeContainersByID diff (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestDestroyDeletesLabLabeledLeftoverContainers locks in the destroy leak
+// fix: when the destroy parses a reduced topology (a node materialized only
+// through template variables disappears from the parse), containers carrying
+// the lab label must still be removed via the label-based leftover sweep.
+// Not parallel: the destroy test harness drives global runtime-behavior state
+// shared across the destroy tests.
+func TestDestroyDeletesLabLabeledLeftoverContainers(t *testing.T) {
+	registerDestroyTestRuntime()
+	withTestHostsFiles(t, t.TempDir())
+
+	topo := writeDestroyTestTopology(t, "leaky")
+	labDir := t.TempDir()
+
+	known := clabruntime.GenericContainer{
+		ID:    "idn100000000",
+		Names: []string{"clab-leaky-n1"},
+		State: "running",
+		Labels: map[string]string{
+			clabconstants.Containerlab: "leaky",
+			clabconstants.TopoFile:     topo,
+			clabconstants.NodeLabDir:   labDir,
+			clabconstants.NodeName:     "n1",
+		},
+	}
+	// The leaked container: deployed with a template var that the destroy
+	// without vars doesn't know, so the reduced topology has no node for it.
+	leftover := clabruntime.GenericContainer{
+		ID:    "idx200000000",
+		Names: []string{"clab-leaky-extra"},
+		State: "running",
+		Labels: map[string]string{
+			clabconstants.Containerlab: "leaky",
+			clabconstants.NodeName:     "extra",
+		},
+	}
+
+	behavior := &destroyTestBehavior{
+		containers: []clabruntime.GenericContainer{known, leftover},
+	}
+	setDestroyTestBehavior(t, behavior)
+
+	c, err := NewContainerLab(
+		WithTimeout(time.Minute),
+		WithTopoPath(topo, nil),
+		WithRuntime("destroytest", &clabruntime.RuntimeConfig{}),
+		WithSkippedBindsPathsCheck(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.Destroy(
+		context.Background(),
+		WithDestroyMaxWorkers(1),
+		WithDestroyCleanup(),
+	)
+	if err != nil {
+		t.Fatalf("destroy failed: %v", err)
+	}
+
+	deleted := behavior.DeletedNames()
+	for _, want := range []string{"clab-leaky-n1", "clab-leaky-extra"} {
+		if !slices.Contains(deleted, want) {
+			t.Fatalf("destroy did not delete container %q; deleted = %v", want, deleted)
+		}
+	}
+
+	// The lab dir must be gone with --cleanup after a successful destroy.
+	if _, statErr := os.Stat(labDir); !os.IsNotExist(statErr) {
+		t.Fatalf("lab dir survived cleanup: %v", statErr)
+	}
 }

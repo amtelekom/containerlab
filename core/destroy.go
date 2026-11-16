@@ -48,6 +48,17 @@ func (c *CLab) Destroy(ctx context.Context, options ...DestroyOption) (err error
 			tailscaleContainers, err = c.discoverTailscaleContainers(ctx, opts.nodeFilter)
 			containers = append(containers, tailscaleContainers...)
 		}
+		// Per-node listing misses containers whose topology node is only
+		// materialized through template variables (a destroy run without
+		// --vars parses a reduced topology). Union with every container that
+		// carries the lab label so nothing carrying it leaks.
+		if err == nil && c.Config.Name != "" && c.LabRuntime == nil {
+			var labContainers []clabruntime.GenericContainer
+			labContainers, err = c.ListContainers(ctx, WithListLabName(c.Config.Name))
+			if err == nil {
+				containers = dedupeContainersByID(append(containers, labContainers...))
+			}
+		}
 	default:
 		var listOpts []ListOption
 
@@ -132,6 +143,30 @@ func (c *CLab) Destroy(ctx context.Context, options ...DestroyOption) (err error
 	}
 
 	return nil
+}
+
+// dedupeContainersByID removes duplicate entries by container ID, keeping the
+// first occurrence in order. Destroy flows union per-node and label-based
+// container lists, which may legitimately hold the same container twice.
+func dedupeContainersByID(containers []clabruntime.GenericContainer) []clabruntime.GenericContainer {
+	if len(containers) < 2 {
+		return containers
+	}
+
+	seen := make(map[string]struct{}, len(containers))
+	out := containers[:0]
+
+	for _, ctr := range containers {
+		if ctr.ID != "" {
+			if _, dup := seen[ctr.ID]; dup {
+				continue
+			}
+			seen[ctr.ID] = struct{}{}
+		}
+		out = append(out, ctr)
+	}
+
+	return out
 }
 
 // creates a mostly cloned version of the current c but set to the new topology, and with the
@@ -394,8 +429,44 @@ func (c *CLab) destroy(ctx context.Context, maxWorkers uint, keepMgmtNet bool) e
 
 	// If we have nodes defined (from topology file), list containers by node.
 	// Otherwise, list containers by lab name label (for destroy-by-name-only case).
+	var leftoverContainers []clabruntime.GenericContainer
+
 	if len(c.Nodes) > 0 {
 		containers, err = c.ListNodesContainersIgnoreNotFound(ctx)
+		if err != nil {
+			return err
+		}
+
+		nodeIDs := make(map[string]struct{}, len(containers))
+		for _, ctr := range containers {
+			nodeIDs[ctr.ID] = struct{}{}
+		}
+
+		// Per-node listing misses containers whose topology node is materialized
+		// only via template variables: a destroy run without --vars parses a
+		// reduced topology and those nodes vanish from c.Nodes. Track what still
+		// carries the lab label but is not covered by the per-node list for
+		// direct deletion below.
+		if c.Config.Name != "" && c.LabRuntime == nil {
+			labContainers, lErr := c.ListContainers(ctx, WithListLabName(c.Config.Name))
+			if lErr != nil {
+				return lErr
+			}
+			for _, ctr := range labContainers {
+				if ctr.Labels[clabconstants.ToolType] != "" {
+					continue
+				}
+				if _, covered := nodeIDs[ctr.ID]; covered {
+					continue
+				}
+				leftoverContainers = append(leftoverContainers, ctr)
+			}
+			log.Debugf(
+				"label-based destroy sweep: %d labeled containers, %d leftover for direct deletion",
+				len(labContainers),
+				len(leftoverContainers),
+			)
+		}
 	} else if c.Config.Name != "" {
 		containers, err = c.ListContainers(ctx, WithListLabName(c.Config.Name))
 	}
@@ -424,7 +495,7 @@ func (c *CLab) destroy(ctx context.Context, maxWorkers uint, keepMgmtNet bool) e
 		}
 	}
 
-	if len(containers) == 0 {
+	if len(containers) == 0 && len(leftoverContainers) == 0 {
 		if len(c.Nodes) > 0 && len(c.Links) > 0 {
 			c.deleteSpecialLinkNodes(ctx)
 		}
@@ -432,7 +503,7 @@ func (c *CLab) destroy(ctx context.Context, maxWorkers uint, keepMgmtNet bool) e
 	}
 
 	if maxWorkers == 0 {
-		maxWorkers = uint(len(containers))
+		maxWorkers = uint(len(containers) + len(leftoverContainers))
 	}
 
 	log.Info("Destroying lab", "name", c.Config.Name)
@@ -453,6 +524,7 @@ func (c *CLab) destroy(ctx context.Context, maxWorkers uint, keepMgmtNet bool) e
 		}
 		c.deleteNodes(ctx, maxWorkers)
 		c.deleteContainersDirect(ctx, orphanSidecars)
+		c.deleteContainersDirect(ctx, leftoverContainers)
 	} else {
 		c.deleteContainersDirect(ctx, containers)
 	}

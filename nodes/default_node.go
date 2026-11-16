@@ -1162,6 +1162,11 @@ func (d *DefaultNode) GetSSHConfig() *clabtypes.SSHConfig {
 }
 
 func (d *DefaultNode) GetContainerStatus(ctx context.Context) clabruntime.ContainerStatus {
+	if d.Runtime == nil {
+		// Nodes without a bound runtime (e.g. test fixtures) are not backed by
+		// any container.
+		return clabruntime.NotFound
+	}
 	return d.Runtime.GetContainerStatus(ctx, d.OverwriteNode.GetContainerName())
 }
 

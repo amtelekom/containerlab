@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../../schemas/clab.schema.json
+# Copyright 2026 Nokia
+# Licensed under the BSD 3-Clause License.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Regression topology for the destroy-by-name leak: the "extra" node only
+# exists when the includeExtra template variable is set. A destroy run that
+# parses this topology without --vars sees a reduced node set and must still
+# remove the leftover container labelled with the lab name.
+name: leak-regression
+
+topology:
+  nodes:
+    n1:
+      kind: linux
+      image: alpine:latest
+    {{ if .includeExtra }}
+    extra:
+      kind: linux
+      image: alpine:latest
+    {{ end }}

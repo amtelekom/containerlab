@@ -195,7 +195,11 @@ func (c *CLab) deploy( //nolint: funlen
 	log.Debugf("lab Conf: %+v", c.Config)
 
 	if options.reconfigure {
-		_ = c.destroy(ctx, uint(len(c.Nodes)), true)
+		// destroy errors must not be swallowed: leftover containers would make
+		// the following topology check report a bogus uniqueness conflict.
+		if err := c.destroy(ctx, uint(len(c.Nodes)), true); err != nil {
+			return nil, fmt.Errorf("reconfigure destroy phase failed: %w", err)
+		}
 		log.Info("Removing directory", "path", c.TopoPaths.TopologyLabDir())
 
 		if err := os.RemoveAll(c.TopoPaths.TopologyLabDir()); err != nil {
